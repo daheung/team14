@@ -1,0 +1,169 @@
+
+# =========================
+# API: PATCH /posts/{postId}
+# =========================
+
+function PATCH_EditPost(request, postId):
+    user = Auth.requireLogin(request)                  # 401 if not logged in
+
+    input = parseJson(request.body)
+    # input example:
+    # {
+    #   "title": "...",              (optional)
+    #   "content": "...",            (optional)
+    #   "tags": ["a","b"],           (optional)
+    #   "attachments": [...],        (optional)
+    #   "expectedVersion": 12        (optional; optimistic lock)
+    # }
+
+    # 1) Load & basic guards
+    post = PostRepo.findById(postId)
+    if post == null:
+        return HTTP 404
+
+    if post.status == "DELETED":
+        return HTTP 410  # gone (or 404 policy)
+
+    if post.isLocked == true:
+        return HTTP 423  # locked (or 403/409 policy)
+
+    # 2) Authorization (작성자 or 관리자 등)
+    if not Authz.canEditPost(user, post):
+        return HTTP 403
+
+    # 3) Concurrency (Optimistic Lock)
+    if input.expectedVersion exists:
+        if post.version != input.expectedVersion:
+            return HTTP 409 with {
+                "message": "Version conflict",
+                "currentVersion": post.version
+            }
+
+    # 4) Validate (부분 수정이므로 제공된 필드만 검증)
+    if input.title exists:
+        Validator.requireNonBlank(input.title)
+        Validator.maxLength(input.title, 200)
+
+    if input.content exists:
+        Validator.requireNonBlank(input.content)
+        Validator.maxLength(input.content, 20000)
+
+    if input.tags exists:
+        Validator.maxTags(input.tags, 10)
+        Validator.validateTagFormat(input.tags)
+
+    if input.attachments exists:
+        Validator.validateAttachments(input.attachments)
+
+    # 5) Sanitize / Normalize (XSS 방지, 공백 정리 등)
+    patch = {}
+    if input.title exists:
+        patch.title = Sanitize.trim(input.title)
+
+    if input.content exists:
+        patch.content = Sanitize.htmlSafe(input.content)    # or markdown whitelist
+
+    if input.tags exists:
+        patch.tags = Normalize.uniqueLower(input.tags)
+
+    if input.attachments exists:
+        patch.attachments = Normalize.attachmentDiff(input.attachments)
+
+    # 6) Transaction: update + revision/history + relations
+    return DB.transaction(() =>:
+        # 6-1) Re-read "for update" if needed (pessimistic option)
+        postForUpdate = PostRepo.findByIdForUpdate(postId)
+
+        # 6-2) Re-check concurrency inside txn (권장)
+        if input.expectedVersion exists and postForUpdate.version != input.expectedVersion:
+            throw ConflictError(currentVersion = postForUpdate.version)
+
+        # 6-3) Save revision snapshot (수정 이력)
+        # revision에는 "수정 전" 또는 "수정 후" 둘 중 하나를 저장해도 됨(정책)
+        PostRevisionRepo.insert({
+            postId: postForUpdate.id,
+            editorUserId: user.id,
+            beforeTitle: postForUpdate.title,
+            beforeContent: postForUpdate.content,
+            beforeTags: PostTagRepo.listByPostId(postId),
+            beforeAttachments: AttachmentRepo.listByPostId(postId),
+            editedAt: now()
+        })
+
+        # 6-4) Apply patch fields
+        if patch.title exists:
+            postForUpdate.title = patch.title
+
+        if patch.content exists:
+            postForUpdate.content = patch.content
+
+        postForUpdate.updatedAt = now()
+        postForUpdate.updatedBy = user.id
+        postForUpdate.version = postForUpdate.version + 1
+
+        PostRepo.update(postForUpdate)
+
+        # 6-5) Sync relations (tags, attachments)
+        if patch.tags exists:
+            PostTagRepo.replaceAll(postId, patch.tags)
+
+        if patch.attachments exists:
+            AttachmentService.sync(postId, patch.attachments, user)
+
+        # 6-6) Domain events / cache invalidation
+        Cache.invalidate("post:" + postId)
+        Cache.invalidate("post_list:*")           # 목록 캐시가 있다면 범위 무효화/갱신
+        EventBus.publish("PostUpdated", {
+            postId: postId,
+            editorUserId: user.id,
+            newVersion: postForUpdate.version
+        })
+
+        # 6-7) Return updated resource
+        updated = PostRepo.findById(postId)
+        return HTTP 200 with serialize(updated)
+    )
+    catch ConflictError as e:
+        return HTTP 409 with {
+            "message": "Version conflict",
+            "currentVersion": e.currentVersion
+        }
+    catch ValidationError as e:
+        return HTTP 400 with e.details
+    catch Exception:
+        return HTTP 500
+
+
+# =========================
+# Authorization policy example
+# =========================
+function canEditPost(user, post):
+    if user.role == "ADMIN":
+        return true
+    if post.authorId == user.id and post.status == "PUBLISHED":
+        return true
+    if post.authorId == user.id and post.status == "DRAFT":
+        return true
+    return false
+
+
+# =========================
+# Attachment sync example
+# =========================
+function AttachmentService.sync(postId, attachmentPatch, user):
+    # attachmentPatch could be:
+    # { add: [...], remove: [...], keep: [...] } or final list
+
+    current = AttachmentRepo.listByPostId(postId)
+
+    diff = Diff.compute(current, attachmentPatch.finalList)
+    for each a in diff.toRemove:
+        AttachmentRepo.delete(postId, a.id)
+
+    for each a in diff.toAdd:
+        # security: user must own uploaded file or have permission
+        if not FileAuth.canBind(user, a.fileId):
+            throw ValidationError("invalid attachment ownership")
+        AttachmentRepo.insert(postId, a)
+
+    return
