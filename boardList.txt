@@ -1,0 +1,126 @@
+CONST MAX_PAGE_SIZE = 50
+CONST ALLOWED_SORT = {"latest", "popular", "views", "comments"}
+CONST ALLOWED_ORDER = {"asc", "desc"}
+
+function listPosts(user, req):
+    # ---------------------------
+    # A. Validate & Normalize
+    # ---------------------------
+    page = max(req.page ?? 1, 1)
+
+    sizeRaw = req.size ?? 20
+    size = clamp(sizeRaw, 1, MAX_PAGE_SIZE)
+
+    sort = req.sort in ALLOWED_SORT ? req.sort : "latest"
+    order = req.order in ALLOWED_ORDER ? req.order : "desc"
+
+    # ---------------------------
+    # B. Decide Visibility Scope
+    # ---------------------------
+    scope = {}
+    if user == null:  # anonymous
+        scope.statusAllowed = {"PUBLISHED"}
+        scope.visibilityAllowed = {"PUBLIC"}
+    else if user.isAdmin:
+        scope.statusAllowed = {"PUBLISHED"}
+        scope.visibilityAllowed = {"PUBLIC", "PRIVATE"}
+
+        if req.includeHidden == true:
+            scope.statusAllowed.add("HIDDEN")
+        if req.includeDeleted == true:
+            scope.statusAllowed.add("DELETED")   # 소프트삭제까지 포함
+    else:  # normal logged-in
+        scope.statusAllowed = {"PUBLISHED"}
+        scope.visibilityAllowed = {"PUBLIC"}    # 기본은 공개글만
+        scope.canSeeOwnPrivate = true           # 내 비공개 글은 예외적으로 허용(정책)
+
+    # ---------------------------
+    # C. Build Filter Conditions
+    # ---------------------------
+    cond = new Condition()
+
+    # status/visibility 조건
+    cond.status IN scope.statusAllowed
+
+    if user == null:
+        cond.visibility IN {"PUBLIC"}
+    else if user.isAdmin:
+        cond.visibility IN scope.visibilityAllowed
+    else:
+        # 공개글 + (내 글인 경우 PRIVATE 허용)
+        # 1) 공개글
+        # 2) userId == authorId 인 글은 PRIVATE도 포함
+        cond = cond AND (
+            (visibility == "PUBLIC")
+            OR (scope.canSeeOwnPrivate AND authorId == user.id AND visibility == "PRIVATE")
+        )
+
+    # 검색/필터
+    if req.keyword not empty:
+        cond = cond AND (title CONTAINS req.keyword OR content CONTAINS req.keyword)
+
+    if req.categoryId exists:
+        cond = cond AND (categoryId == req.categoryId)
+
+    if req.tag exists:
+        cond = cond AND (tags CONTAINS req.tag)
+
+    if req.authorId exists:
+        # (정책) authorId 지정은 공개 범위 내에서만 의미
+        cond = cond AND (authorId == req.authorId)
+
+    if req.fromDate exists:
+        cond = cond AND (createdAt >= req.fromDate)
+
+    if req.toDate exists:
+        cond = cond AND (createdAt <= req.toDate)
+
+    # ---------------------------
+    # D. Pinned / Notice Policy
+    # ---------------------------
+    pinnedItems = []
+    if req.includePinned == true:
+        pinnedCond = cond.clone()
+        pinnedCond = pinnedCond AND (isPinned == true)
+        pinnedItems = repo.find(pinnedCond, sort="pinRank", order="asc", limit=20)
+
+        # pinned 정책 예시:
+        # - pinned는 1페이지에서만 보여준다
+        if page != 1:
+            pinnedItems = []  # 정책 선택
+
+    # ---------------------------
+    # E. Count & Pagination
+    # ---------------------------
+    # pinned를 "항상 상단 고정"으로 빼고 싶으면 count에서 제외/포함 정책 결정
+    totalCount = repo.count(cond AND (isPinned == false OR req.includePinned == false))
+
+    offset = (page - 1) * size
+
+    items = repo.find(
+        cond AND (req.includePinned == true ? (isPinned == false) : (true)),
+        sort=sort,
+        order=order,
+        offset=offset,
+        limit=size
+    )
+
+    # ---------------------------
+    # F. Merge pinned + items (dedupe)
+    # ---------------------------
+    result = mergeUniqueById(pinnedItems, items)
+
+    # ---------------------------
+    # G. Response
+    # ---------------------------
+    totalPages = ceil(totalCount / size)
+    return {
+        "items": result,
+        "pageInfo": {
+            "page": page,
+            "size": size,
+            "totalCount": totalCount,
+            "totalPages": totalPages,
+            "hasNext": page < totalPages
+        }
+    }
